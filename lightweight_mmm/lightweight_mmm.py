@@ -311,9 +311,16 @@ class LightweightMMM:
           "Media data must have either 2 dims for national model or 3 for geo "
           "models.")
     if media.ndim == 3 and media_prior.ndim == 1:
+      print( "INFO: expanding media prior dims..." )
       media_prior = jnp.expand_dims(media_prior, axis=-1)
 
-    if media.shape[1] != len(media_prior):
+    if isinstance( media_prior, numpyro.distributions.Distribution ):
+      reparm0 = media_prior.reparametrized_params[0]
+      parm0 = getattr( media_prior, reparm0 )
+      if media.shape[1] != len( parm0 ):
+        raise ValueError( "The number of data channels provided must match the "
+                            "length of the prior distribution's parameters" )
+    elif media.shape[1] != len(media_prior):
       raise ValueError("The number of data channels provided must match the "
                        "number of cost values.")
     if media.min() < 0:
@@ -361,12 +368,13 @@ class LightweightMMM:
         num_warmup=number_warmup,
         num_samples=number_samples,
         num_chains=number_chains)
+
     mcmc.run(
         rng_key=jax.random.PRNGKey(seed),
         media_data=jnp.array(media),
         extra_features=extra_features,
         target_data=jnp.array(target),
-        media_prior=jnp.array(media_prior),
+        media_prior=media_prior,                     # removed jnp.array
         degrees_seasonality=degrees_seasonality,
         frequency=seasonality_frequency,
         transform_function=self._model_transform_function,
@@ -522,11 +530,13 @@ class LightweightMMM:
       full_extra_features = None
     if seed is None:
       seed = utils.get_time_seed()
+
+
     prediction = self._predict(
         rng_key=jax.random.PRNGKey(seed=seed),
         media_data=full_media,
         extra_features=full_extra_features,
-        media_prior=jnp.array(self._media_prior),
+        media_prior=self._media_prior,                        # removed jnp.array
         degrees_seasonality=self._degrees_seasonality,
         frequency=self._seasonality_frequency,
         weekday_seasonality=self._weekday_seasonality,
@@ -534,6 +544,7 @@ class LightweightMMM:
         model=self._model_function,
         custom_priors=self.custom_priors,
         posterior_samples=self.trace)["mu"][:, previous_media.shape[0]:]
+
     if target_scaler:
       prediction = target_scaler.inverse_transform(prediction)
 

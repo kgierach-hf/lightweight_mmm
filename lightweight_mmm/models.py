@@ -345,9 +345,18 @@ def media_mix_model(
       name="channel_media_plate",
       size=n_channels,
       dim=-2 if media_data.ndim == 3 else -1):
-    coef_media = numpyro.sample(
-        name="channel_coef_media" if media_data.ndim == 3 else "coef_media",
-        fn=dist.HalfNormal(scale=media_prior))
+
+    if isinstance( media_prior, numpyro.distributions.Distribution ):
+        print( 'INFO: sampling from provided media priors Distribution object' )
+        coef_media = numpyro.sample(
+            name="channel_coef_media" if media_data.ndim == 3 else "coef_media",
+            fn=media_prior )
+    else:
+        media_prior = jnp.array(media_prior)
+        coef_media = numpyro.sample(
+            name="channel_coef_media" if media_data.ndim == 3 else "coef_media",
+            fn=dist.HalfNormal(scale=media_prior))
+
     if media_data.ndim == 3:
       with numpyro.plate(
           name="geo_media_plate",
