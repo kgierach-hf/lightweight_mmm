@@ -63,6 +63,7 @@ Prior = Union[
 
 _NAMES_TO_MODEL_TRANSFORMS = immutabledict.immutabledict({
     "hill_adstock": models.transform_hill_adstock,
+    "hill_radstock": models.transform_hill_radstock,
     "adstock": models.transform_adstock,
     "carryover": models.transform_carryover
 })
@@ -271,7 +272,8 @@ class LightweightMMM:
       init_strategy: Callable[[Mapping[Any, Any], Any],
                               jnp.ndarray] = numpyro.infer.init_to_median,
       custom_priors: Optional[Dict[str, Prior]] = None,
-      seed: Optional[int] = None) -> None:
+      seed: Optional[int] = None,
+      channel_opts: Optional[Dict[str, Any]] = None ) -> None:
     """Fits MMM given the media data, extra features, costs and sales/KPI.
 
     For detailed information on the selected model please refer to its
@@ -361,13 +363,20 @@ class LightweightMMM:
     kernel = numpyro.infer.NUTS(
         model=self._model_function,
         target_accept_prob=target_accept_prob,
-        init_strategy=init_strategy)
+        init_strategy=init_strategy )
+
+    # from numpyro.infer import ESS, AIES
+    # kernel = ESS( model=self._model_function, moves={ ESS.DifferentialMove() : 0.8,
+    #                            ESS.RandomMove() : 0.2} )
+    # kernel = AIES(model=self._model_function, moves={ AIES.DEMove() : 0.5,
+    #                                                    AIES.StretchMove() : 0.5 } )
 
     mcmc = numpyro.infer.MCMC(
         sampler=kernel,
         num_warmup=number_warmup,
-        num_samples=number_samples,
-        num_chains=number_chains)
+        num_samples=number_samples,   # number_samples | 1500
+        num_chains=number_chains,     # number_chains
+        chain_method='vectorized' )   # 'parallel'
 
     mcmc.run(
         rng_key=jax.random.PRNGKey(seed),
@@ -379,7 +388,9 @@ class LightweightMMM:
         frequency=seasonality_frequency,
         transform_function=self._model_transform_function,
         weekday_seasonality=weekday_seasonality,
-        custom_priors=custom_priors)
+        custom_priors=custom_priors,
+        channel_opts=channel_opts,
+        transform_kwargs=channel_opts )
 
     self.custom_priors = custom_priors
     if media_names is not None:
@@ -401,6 +412,7 @@ class LightweightMMM:
     self.media = media
     self._extra_features = extra_features# jax-devicearray
     self._mcmc = mcmc
+    self.channel_opts = channel_opts
     logging.info("Model has been fitted")
 
   def print_summary(self) -> None:

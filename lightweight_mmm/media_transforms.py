@@ -16,10 +16,14 @@
 
 import functools
 from typing import Union
+from functools import partial
 
 import jax
 import jax.numpy as jnp
-
+import jax.scipy.integrate as jintegrate
+import scipy.integrate as integrate
+import numpy as np
+import math
 
 @functools.partial(jax.jit, static_argnums=[0, 1])
 def calculate_seasonality(
@@ -59,6 +63,343 @@ def calculate_seasonality(
   return (season_matrix * gamma_seasonality).sum(axis=2).sum(axis=1)
 
 
+# karl begin
+
+#
+# wrapper for evaluating the Geometric Decay function
+# using JAX primitives
+#
+def geo_f( lam, t, scaler = 1.0 ):
+    return jnp.exp( -1.0 * scaler * lam * t )
+
+
+from jax import custom_jvp
+
+#
+# computes the shifted geometric weights for applying the adstock
+#
+@custom_jvp
+def compute_weights_host( lam ):
+
+    pct=0.5
+    scaler = 1.0
+    max_week=13.0
+    max_horizon=100
+
+    bVerbose = False
+
+    if bVerbose:
+        print( 'CWH(): BEGIN METHOD' )
+
+    def geo_f_local( lam, t, scaler = 1.0 ):
+        return np.exp( -1.0 * scaler * lam * t )
+
+    ret_val = np.zeros( int(max_week+1), dtype=np.float32 )
+    norm_const = integrate.quad( geo_f_local, 0, max_horizon, args=(lam) )[0]
+    # print( "norm_const: ", norm_const )
+    t = np.arange( 0.0, max_week, 0.1 )
+    res = max_week
+    for x in range(len(t)):
+        v = (integrate.quad( geo_f_local, 0, t[x], args=(lam, scaler) )[0] / norm_const)
+        if v > (1.0-pct):
+            res = t[x]
+            break
+
+    mean_point = res
+    mean_time = res
+    cur_week = math.ceil( res )
+    for weekIdx in range( cur_week, 0, -1 ):
+        startPt = max( res - 1.0, 0 )
+        # print( "weekIdx[", weekIdx, "]: ", startPt,  " | ", res )
+        v = (integrate.quad( geo_f_local, startPt, res, args=(lam, scaler) )[0] / norm_const)
+        res = res - 1.0
+        ret_val[ weekIdx-1 ] = v
+
+    for weekIdx in range( cur_week, int(max_week) ):
+        endPt = (mean_time+1) if weekIdx < (max_week-1) else max_horizon
+        v = (integrate.quad( geo_f_local, mean_time, endPt, args=(lam, scaler) )[0] / norm_const)
+        mean_time = mean_time + 1.0
+        ret_val[ weekIdx ] = v
+
+    ret_val[ int(max_week) ] = mean_point
+    if bVerbose:
+        print( 'CWH(): ', ret_val )
+    return ret_val
+
+
+# code copying
+cwh = jax.custom_jvp( compute_weights_host )
+
+#
+# JVP callback
+#
+@compute_weights_host.defjvp
+def compute_weights_host_jvp( primals, tangents ):
+    print( "compute_weights_host_jvp(): primals: ", primals )
+    print( "compute_weights_host_jvp(): tangents: ", tangents )
+    lam   = primals
+    x_dot = tangents
+    primal_out = compute_weights_host( lam )
+    tangent_out = -1 * lam * jnp.multiply( primal_out, x_dot )
+    return primal_out, tangent_out
+
+
+#
+# pct=0.5, scaler = 1.0, max_week=13.0, max_horizon=100
+#
+def compute_weights_wrapper(  lam ):
+    result_shape = jax.ShapeDtypeStruct( (13+1,), lam.dtype )
+    return jax.pure_callback( compute_weights_host, result_shape, lam )
+
+
+#
+# performs the actual work of distributing the spend according to the
+# weights and the provided shift value.
+#
+@custom_jvp
+def distribute_weights( shifted_weights, mean_week, colData, colDataLen, weeks ):
+    # print( 'distribute_weights(): BEGIN' )
+
+    bVerbose = False
+
+    rev_shift_start = math.ceil( mean_week )  # week index where spend is carried forward
+
+    # print( 'distribute_weights: shape=', np.shape(colData) )
+    # print( 'distribute_weights: weeks  : ', weeks )
+
+    colDataOut = np.zeros( np.shape(colData), dtype=np.float32 )
+
+    for dIdx in range( 0, colDataLen ):
+        mul_data    = np.ones( weeks, dtype=np.float32 )
+        spnd_data   = mul_data * colData[dIdx]
+        split_spend = np.multiply( spnd_data, shifted_weights )
+
+        if bVerbose:
+            print( "-------- dIdx: ", dIdx, " -------------------------: split spend type: ", type(split_spend) )
+
+        # find start index of xform_data
+        sIdx = max( (-1*rev_shift_start) + dIdx, 0 )
+        # find start index of weights
+        weightsIdx = np.where( dIdx >= rev_shift_start, 0, (rev_shift_start - dIdx) )
+
+        if bVerbose:
+            print( "weightsIdx: ", weightsIdx, " | ", jnp.shape( weightsIdx ) )
+
+        eIdx = (sIdx + weeks - weightsIdx)
+        if bVerbose:
+            print( '    sIdx: ', sIdx, ' -> eIdx: ', eIdx )
+        weightsEnd = -1
+        # eIdx = min( colDataLen, eIdx )
+        if eIdx > colDataLen:
+            weightsEnd = len(split_spend) - (eIdx-colDataLen)
+
+        split_spend  = split_spend[weightsIdx:weightsEnd]
+
+        leftPad      = sIdx
+        rightPad     = colDataLen - sIdx - len(split_spend)
+
+        if bVerbose:
+            print( '    split_spend (final): ', split_spend, " | ", len(split_spend), " | weightsEndIdx: ", weightsEnd )
+            print( '    pads: ',  (leftPad,rightPad) )
+
+        padded_spend = np.pad( split_spend, (leftPad,rightPad) )
+
+        if bVerbose:
+            print( '    len padded spend: ', len(padded_spend) )
+
+        colDataOut   = np.add( colDataOut, padded_spend )
+
+    if bVerbose:
+        print( 'distribute_weights(END): colDataOut: (final): ', np.shape(colDataOut), "|", type(colDataOut) )
+
+    return np.array( colDataOut, dtype=np.float32 )
+
+
+#
+dw = jax.custom_jvp( distribute_weights )
+
+
+#
+# JVP callback
+#
+@distribute_weights.defjvp
+def distribute_weights_host_jvp( primals, tangents ):
+    print( "distribute_weights_host_jvp(): primals: ", primals )
+    print( "distribute_weights_host_jvp(): tangents: ", tangents )
+    shifted_weights, mean_week, colData, colDataLen, weeks = primals
+    x_dot = tangents
+    primal_out = distribute_weights( shifted_weights, mean_week, colData, colDataLen, weeks )
+    tangent_out = -1 * jnp.multiply( primal_out, x_dot )
+    return primal_out, tangent_out
+
+
+#
+# implemented shift logic as JAX Callback since the shift amount comes out of
+#   a sampled variable.
+#
+def distribute_weights_wrapper( shifted_weights, mean_week, colData, colDataLen, weeks ):
+    result_shape = jax.ShapeDtypeStruct( jnp.shape(colData), colData.dtype )
+    return jax.pure_callback( distribute_weights, result_shape, shifted_weights, mean_week, colData, colDataLen, weeks )
+
+
+#
+# compute standard (unshifted) weights for geometric adstock
+#
+@jax.jit
+def compute_std_weights( lam ):
+    scaler = 1.0
+    max_week=13.0
+    max_horizon=100
+
+    ret_val = jnp.zeros( int(max_week) )
+    # norm_const = jintegrate.quad( geo_f, 0, max_horizon, args=(lam) )[0]
+    x = jnp.linspace( 0, max_horizon, 100 )
+    y = geo_f( lam, x )
+    norm_const = jnp.sum( jintegrate.trapezoid( y, x ) )
+    # print( "norm_const: ", norm_const )
+
+    mean_time = 0
+    for weekIdx in range( 0, int(max_week) ):
+        # endPt = (mean_time+1) if weekIdx < (max_week-1) else max_horizon
+        endPt = jnp.where( weekIdx < (max_week-1), (mean_time+1), max_horizon )
+        x = jnp.linspace( mean_time, endPt, 10 )
+        y = geo_f( lam, x )
+        v = jnp.sum( jintegrate.trapezoid( y, x ) / norm_const )
+        mean_time = mean_time + 1.0
+        ret_val = ret_val.at[ weekIdx ].set(v)
+
+    return ret_val
+
+
+#
+# reverse-shifted adstock application
+#
+@functools.partial( jax.jit, static_argnames=["num_weeks", "colDataLen"])
+def run_reverse_shift( lag_weight, colData, num_weeks, colDataLen ):
+    # print(  "run_reverse_shift: lag_weight: ", lag_weight, ":", type(lag_weight) )
+    # shifted_weights, mean_week = compute_weights( 0.5, col_lag_weight )
+    shifted_weights = compute_weights_wrapper( lag_weight )
+    # print( 'WRAPPER weights out: ', shifted_weights )
+    mean_week = shifted_weights[-1]
+    # print( 'mean week x: ', mean_week )
+    weights_only = shifted_weights[0:13]
+    # print( 'weights only: ', shifted_weights, "|", jnp.shape(shifted_weights) )
+
+    colData = distribute_weights_wrapper( weights_only, mean_week, colData, colDataLen, num_weeks )
+
+    # print( "run_reverse_shift: ", colData, " | ", jnp.shape( colData ) )
+    return colData
+
+
+#
+# run a straightforward Geometric adstock shift, on a column by column basis.
+# The idea behind this is that some Channels (columns) follow a standard shift while others
+#   require backwards shift in conjunction with adstock weights.
+#
+@functools.partial( jax.jit, static_argnames=["num_weeks", "colDataLen"] )
+def run_std_shift( lag_weight, origSpend, num_weeks, colDataLen ):
+
+    std_weights = compute_std_weights( lag_weight )
+
+    # print( "run_std_shift(): colData: ", origSpend, ", weeks: ", num_weeks, " len(colData): ", colDataLen )
+    # print( "run_std_shift() std weights: ", std_weights )
+    # print( "sum std weights: ", sum(std_weights) )
+
+    colData = jnp.zeros( jnp.shape( origSpend )  )
+
+    # process standard normalized weights
+    inspColDataLen = len(colData)
+    # print(  'inspColDataLen: ', inspColDataLen )
+
+    for dIdx in range(0, len(colData)):
+        # print( "dIdx: ", dIdx )
+        mul_data    = jnp.ones( 13 )
+        spnd_data   = mul_data * origSpend[dIdx]
+        split_spend = jnp.multiply( spnd_data, std_weights )
+
+        wIdx = 0
+        range_limit = min( dIdx + 13, inspColDataLen )
+        # print( "range_limit: ", range_limit )
+        for npIdx in range( dIdx, range_limit ):
+            colData = colData.at[ npIdx ].add( split_spend[wIdx] )
+            wIdx = wIdx + 1
+
+    return colData
+
+
+#
+# radstock = "reverse adstock"
+#
+#   the method allows for configured channels to have spend shifted back in time
+#   as the adstock weights are applied.
+#   -> this is done by specifying a '1' in the enableReverseShift array.  any channel
+#      with a 0 in the array is specified as a
+#   -> non-configured channels will behave in the normal way; pushing the spend forward only
+#
+# @functools.partial( jax.jit, static_argnames=['normalise','weeks'] )
+#
+@jax.jit
+def radstock( data: jnp.ndarray,
+              lag_weight: float = .9,
+              normalise: bool = True,
+              enableReverseShift = None,
+              weeks = 13 ) -> jnp.ndarray:
+    """Calculates the adstock value of a given array.
+
+    To learn more about advertising lag:
+    https://en.wikipedia.org/wiki/Advertising_adstock
+
+    Args:
+      data: Input array.
+      lag_weight: lag_weight effect of the adstock function. Default is 0.9.
+      normalise: Whether to normalise the output value. This normalization will
+        divide the output values by (1 / (1 - lag_weight)).
+
+    Returns:
+      The adstock output of the input array.
+    """
+
+    # print( 'radstock: enable: ', enableReverseShift, "|", type(enableReverseShift) )
+    print( 'radstock: data dim: ', jnp.shape(data) )
+
+    #
+    jnp_ret = None
+    xform_data = jnp.zeros( np.shape(data) )
+    xdataT = xform_data.T
+    dataT  = data.T
+
+
+    for colIdx in range( 0, len(dataT) ):
+
+        # print( 'lag_weight: ', lag_weight[ colIdx ], " type: ", type(lag_weight) )
+        # col_lag_weight = float( lag_weight[ colIdx ] )
+
+        col_lag_weight = lag_weight[ colIdx ]
+
+        origSpend  = dataT[ colIdx ]
+        colData    = xdataT[ colIdx ]
+        colDataLen = jnp.shape(colData)[0]
+        # print( 'colData shape: ', colDataLen )
+
+        # branch to either normal adstock
+        branch_res = jax.lax.cond( enableReverseShift[colIdx], run_reverse_shift, run_std_shift, col_lag_weight, origSpend, weeks, colDataLen )
+
+        if jnp_ret is None:
+            jnp_ret = branch_res
+        else:
+            # print( 'jnp_ret: ', jnp.shape( jnp_ret ), " , branch_res: ", jnp.shape( branch_res ) )
+            jnp_ret = jnp.vstack( (jnp_ret, branch_res) )
+
+    jnp_ret = jnp.array( jnp_ret.T )
+
+    print( 'radstock(): final shape: ', jnp.shape( jnp_ret ) )
+
+    return  jnp_ret
+
+# karl end
+
+
+
 @jax.jit
 def adstock(data: jnp.ndarray,
             lag_weight: float = .9,
@@ -82,11 +423,13 @@ def adstock(data: jnp.ndarray,
                        data: jnp.ndarray,
                        lag_weight: float = lag_weight) -> jnp.ndarray:
     adstock_value = prev_adstock * lag_weight + data
-    return adstock_value, adstock_value# jax-ndarray
+    return adstock_value, adstock_value # jax-ndarray
 
   _, adstock_values = jax.lax.scan(
       f=adstock_internal, init=data[0, ...], xs=data[1:, ...])
+
   adstock_values = jnp.concatenate([jnp.array([data[0, ...]]), adstock_values])
+
   return jax.lax.cond(
       normalise,
       lambda adstock_values: adstock_values / (1. / (1 - lag_weight)),

@@ -87,6 +87,8 @@ TRANSFORM_PRIORS_NAMES = immutabledict.immutabledict({
     "adstock":
         frozenset((_EXPONENT, _LAG_WEIGHT)),
     "hill_adstock":
+        frozenset((_LAG_WEIGHT, _HALF_MAX_EFFECTIVE_CONCENTRATION, _SLOPE)),
+    "hill_radstock":
         frozenset((_LAG_WEIGHT, _HALF_MAX_EFFECTIVE_CONCENTRATION, _SLOPE))
 })
 
@@ -280,6 +282,66 @@ def transform_carryover(media_data: jnp.ndarray,
   return media_transforms.apply_exponent_safe(data=carryover, exponent=exponent)
 
 
+## begin karl
+
+def transform_hill_radstock(media_data: jnp.ndarray,
+                           custom_priors: MutableMapping[str, Prior],
+                           normalise: bool = True,
+                           enableReverseShift = None ) -> jnp.ndarray:
+    """Transforms the input data with the adstock and hill functions.
+
+    Args:
+      media_data: Media data to be transformed. It is expected to have 2 dims for
+        national models and 3 for geo models.
+      custom_priors: The custom priors we want the model to take instead of the
+        default ones. The possible names of parameters for hill_adstock and
+        exponent are "lag_weight", "half_max_effective_concentration" and "slope".
+      normalise: Whether to normalise the output values.
+
+    Returns:
+      The transformed media data.
+    """
+
+    print( 'transform_hill_radstock(): custom: ', enableReverseShift )
+
+    transform_default_priors = _get_transform_default_priors()["hill_adstock"]
+    with numpyro.plate(name=f"{_LAG_WEIGHT}_plate",
+                       size=media_data.shape[1]):
+        lag_weight = numpyro.sample(
+            name=_LAG_WEIGHT,
+            fn=custom_priors.get(_LAG_WEIGHT,
+                                 transform_default_priors[_LAG_WEIGHT]))
+
+    with numpyro.plate(name=f"{_HALF_MAX_EFFECTIVE_CONCENTRATION}_plate",
+                       size=media_data.shape[1]):
+        half_max_effective_concentration = numpyro.sample(
+            name=_HALF_MAX_EFFECTIVE_CONCENTRATION,
+            fn=custom_priors.get(
+                _HALF_MAX_EFFECTIVE_CONCENTRATION,
+                transform_default_priors[_HALF_MAX_EFFECTIVE_CONCENTRATION]))
+
+    with numpyro.plate(name=f"{_SLOPE}_plate",
+                       size=media_data.shape[1]):
+        slope = numpyro.sample(
+            name=_SLOPE,
+            fn=custom_priors.get(_SLOPE, transform_default_priors[_SLOPE]))
+
+    if media_data.ndim == 3:
+        lag_weight = jnp.expand_dims(lag_weight, axis=-1)
+        half_max_effective_concentration = jnp.expand_dims(
+            half_max_effective_concentration, axis=-1)
+        slope = jnp.expand_dims(slope, axis=-1)
+
+    return media_transforms.hill(
+        data=media_transforms.radstock(
+            data=media_data, lag_weight=lag_weight,
+            normalise=normalise, enableReverseShift=enableReverseShift ),
+        half_max_effective_concentration=half_max_effective_concentration,
+        slope=slope)
+
+## end karl
+
+
 def media_mix_model(
     media_data: jnp.ndarray,
     target_data: jnp.ndarray,
@@ -291,6 +353,7 @@ def media_mix_model(
     transform_kwargs: Optional[MutableMapping[str, Any]] = None,
     weekday_seasonality: bool = False,
     extra_features: Optional[jnp.ndarray] = None,
+    channel_opts: Optional[Dict[str, Any]] = None
 ) -> None:
   """Media mix model.
 
@@ -421,6 +484,25 @@ def media_mix_model(
       intercept + coef_trend * trend ** expo_trend +
       seasonality * coef_seasonality +
       jnp.einsum(media_einsum, media_transformed, coef_media))
+
+
+  #baseline1 = numpyro.deterministic( name="seasonality1", value= intercept + coef_trend * trend ** expo_trend )
+  #print( "baseline1: ", baseline1 )
+
+  #media_xformed = numpyro.deterministic( name="media_xformed", value= media_transformed )
+  #print( "mediax: ", media_xformed )
+
+  #coef_media1 = numpyro.deterministic( name="coef_media1", value= coef_media )
+  #print( "coef_media1: ", coef_media1 )
+
+  #media1 = numpyro.deterministic( name="mediaxform", value= jnp.einsum(media_einsum, media_transformed, coef_media) )
+  #print( "media1: ", media1 )
+  #seasonality1 = numpyro.deterministic( name="seasonality1", value= seasonality * coef_seasonality )
+  #print( "seasonality1: ", seasonality1 )
+  #prediction1 = numpyro.deterministic( name="prediction1", value=prediction )
+  #print( "prediction1: ", prediction1 )
+
+
   if extra_features is not None:
     plate_prefixes = ("extra_feature",)
     extra_features_einsum = "tf, f -> t"  # t = time, f = feature
@@ -444,5 +526,6 @@ def media_mix_model(
     prediction += weekday_series
   mu = numpyro.deterministic(name="mu", value=prediction)
 
+  #print( "mu:(loc): ", mu, ":", sigma, " obs=", target_data )
   numpyro.sample(
       name="target", fn=dist.Normal(loc=mu, scale=sigma), obs=target_data)
