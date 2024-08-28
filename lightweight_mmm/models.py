@@ -76,6 +76,7 @@ MODEL_PRIORS_NAMES = frozenset((
 
 _EXPONENT = "exponent"
 _LAG_WEIGHT = "lag_weight"
+_SHIFT = "shift"
 _HALF_MAX_EFFECTIVE_CONCENTRATION = "half_max_effective_concentration"
 _SLOPE = "slope"
 _AD_EFFECT_RETENTION_RATE = "ad_effect_retention_rate"
@@ -89,7 +90,7 @@ TRANSFORM_PRIORS_NAMES = immutabledict.immutabledict({
     "hill_adstock":
         frozenset((_LAG_WEIGHT, _HALF_MAX_EFFECTIVE_CONCENTRATION, _SLOPE)),
     "hill_radstock":
-        frozenset((_LAG_WEIGHT, _HALF_MAX_EFFECTIVE_CONCENTRATION, _SLOPE))
+        frozenset((_LAG_WEIGHT, _HALF_MAX_EFFECTIVE_CONCENTRATION, _SLOPE, _SHIFT))
 })
 
 GEO_ONLY_PRIORS = frozenset((_COEF_SEASONALITY,))
@@ -136,6 +137,17 @@ def _get_transform_default_priors() -> Mapping[str, Prior]:
                   dist.Gamma(concentration=1., rate=1.),
               _SLOPE:
                   dist.Gamma(concentration=1., rate=1.)
+          }),
+      "hill_radstock":
+          immutabledict.immutabledict({
+              _LAG_WEIGHT:
+                  dist.Beta(concentration1=2., concentration0=1.),
+              _HALF_MAX_EFFECTIVE_CONCENTRATION:
+                  dist.Gamma(concentration=1., rate=1.),
+              _SLOPE:
+                  dist.Gamma(concentration=1., rate=1.),
+              _SHIFT:
+                  dist.Beta(concentration1=1.,concentration0=100.)
           })
   })
 
@@ -304,7 +316,7 @@ def transform_hill_radstock(media_data: jnp.ndarray,
 
     print( 'transform_hill_radstock(): custom: ', enableReverseShift )
 
-    transform_default_priors = _get_transform_default_priors()["hill_adstock"]
+    transform_default_priors = _get_transform_default_priors()["hill_radstock"]
     with numpyro.plate(name=f"{_LAG_WEIGHT}_plate",
                        size=media_data.shape[1]):
         lag_weight = numpyro.sample(
@@ -326,6 +338,12 @@ def transform_hill_radstock(media_data: jnp.ndarray,
             name=_SLOPE,
             fn=custom_priors.get(_SLOPE, transform_default_priors[_SLOPE]))
 
+    with numpyro.plate(name=f"{_SHIFT}_plate",
+                       size=media_data.shape[1]):
+        shift_weeks = numpyro.sample(
+            name=_SHIFT,
+            fn=custom_priors.get(_SHIFT, transform_default_priors[_SHIFT]) )
+
     if media_data.ndim == 3:
         lag_weight = jnp.expand_dims(lag_weight, axis=-1)
         half_max_effective_concentration = jnp.expand_dims(
@@ -334,7 +352,7 @@ def transform_hill_radstock(media_data: jnp.ndarray,
 
     return media_transforms.hill(
         data=media_transforms.radstock(
-            data=media_data, lag_weight=lag_weight,
+            data=media_data, lag_weight=lag_weight, shift_weeks=shift_weeks,
             normalise=normalise, enableReverseShift=enableReverseShift ),
         half_max_effective_concentration=half_max_effective_concentration,
         slope=slope)

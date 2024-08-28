@@ -24,6 +24,9 @@ import jax.scipy.integrate as jintegrate
 import scipy.integrate as integrate
 import numpy as np
 import math
+import numpyro
+import numpyro.distributions as dist
+
 
 @functools.partial(jax.jit, static_argnums=[0, 1])
 def calculate_seasonality(
@@ -149,7 +152,7 @@ def compute_weights_host_jvp( primals, tangents ):
 #
 def compute_weights_wrapper(  lam ):
     result_shape = jax.ShapeDtypeStruct( (13+1,), lam.dtype )
-    return jax.pure_callback( compute_weights_host, result_shape, lam )
+    return jax.pure_callback( cwh, result_shape, lam )
 
 
 #
@@ -272,36 +275,112 @@ def compute_std_weights( lam ):
 
 
 #
+# wrap callback
+#
+def create_zeros_host( pad_size, weights ):
+    # print( 'create_zeros_host(): BEGIN : ', weights )
+    left_pad = pad_size
+    left_pad = min(8, left_pad)
+    left_pad = max(0, left_pad)
+    right_pad = 21 - 13 - left_pad
+    return np.pad( weights, (left_pad, right_pad) )
+
+
+#
+def create_zeros_wrapper( pad_size, weights ):
+    result_shape = jax.ShapeDtypeStruct( (21,), jnp.float32 )
+    return jax.pure_callback( create_zeros_host, result_shape, pad_size, weights )
+
+
+
+# Define the main function that performs padding
+#@jax.custom_vjp
+#def custom_pad(x, p_left, p_right):
+#    return jnp.pad(x, (p_left, p_right))
+
+# Define the forward pass
+# weights are of dim 13, overall convolution array of len 21
+def custom_pad_fwd( pad_size, w ):
+    p_left = pad_size
+    p_right = 21 - 13 - p_left
+    # y = jnp.pad( w, (p_left, p_right) )
+    y = create_zeros_wrapper( pad_size, w )
+
+    # Compute the output (padded array)
+    # y = jnp.pad( x, (p_left, p_right) )
+
+    shp = jnp.shape(w)
+    # print( 'shape w: ', shp, " pad size: ", pad_size )
+    # Return the output and any intermediate values needed for backward pass
+    return y, (shp[0], w, p_left, p_right)
+
+
+#
+# Define the backward pass
+#
+def custom_pad_bwd( res, g ):
+    n, w, p_left, p_right = res
+
+    # Extract the gradient for the output (g)
+    # Only the middle part (corresponding to the original x) of g contributes to the gradient of x
+    # grad_x = g[ p_left : p_left + n ]
+    # grad_x = jax.lax.dynamic_slice( g, p_left, n - p_right )
+    grad_x = w
+
+    # Since pad is not an inputs that we differentiate with respect to,
+    # we return None for them
+    return None, grad_x
+
+
+# define create_zeros_wrapper as a custom_vjp
+create_zeros_wrapper = jax.custom_vjp( create_zeros_wrapper )
+
+
+# Register the forward and backward passes
+create_zeros_wrapper.defvjp( custom_pad_fwd, custom_pad_bwd )
+
+
+NUM_WEEKS = 13
+
+#
 # reverse-shifted adstock application
 #
-@functools.partial( jax.jit, static_argnames=["num_weeks", "colDataLen"])
-def run_reverse_shift( lag_weight, colData, num_weeks, colDataLen ):
-    # print(  "run_reverse_shift: lag_weight: ", lag_weight, ":", type(lag_weight) )
-    # shifted_weights, mean_week = compute_weights( 0.5, col_lag_weight )
-    shifted_weights = compute_weights_wrapper( lag_weight )
-    # print( 'WRAPPER weights out: ', shifted_weights )
-    mean_week = shifted_weights[-1]
-    # print( 'mean week x: ', mean_week )
-    weights_only = shifted_weights[0:13]
-    # print( 'weights only: ', shifted_weights, "|", jnp.shape(shifted_weights) )
+@functools.partial( jax.jit )  # , static_argnums=[0,1]
+def run_reverse_shift( num_weeks, lag_weight, shift_weeks, colData ):
+    # print( "run reverse shift: BEGIN: ", num_weeks )
 
-    colData = distribute_weights_wrapper( weights_only, mean_week, colData, colDataLen, num_weeks )
+    # shift_weeks = numpyro.sample( "shift_" + idx,  dist.Gamma(concentration=2., rate=2.) )
+    shift_weeks = jnp.maximum( 4.0, shift_weeks )
 
-    # print( "run_reverse_shift: ", colData, " | ", jnp.shape( colData ) )
-    return colData
+    # print( "rrs(): lag_weight: ", lag_weight, " num_weeks: ", num_weeks )
 
+    lag_weights_arr = jnp.ones( NUM_WEEKS )
+    lag_weights_arr = lag_weights_arr * lag_weight
+    weights = jnp.power( lag_weights_arr, jnp.arange(NUM_WEEKS, dtype=jnp.float32) )
+    weights = weights / jnp.sum( weights )
+
+    pad = jnp.floor( shift_weeks ).astype(int)
+
+    # pad weights left and right as it is a centered convolution
+    weights = create_zeros_wrapper( pad, weights )
+
+    return jax.scipy.signal.convolve( colData, weights, mode="same" )
 
 #
 # run a straightforward Geometric adstock shift, on a column by column basis.
 # The idea behind this is that some Channels (columns) follow a standard shift while others
 #   require backwards shift in conjunction with adstock weights.
 #
-@functools.partial( jax.jit, static_argnames=["num_weeks", "colDataLen"] )
-def run_std_shift( lag_weight, origSpend, num_weeks, colDataLen ):
+@functools.partial( jax.jit ) # , static_argnums=[0,1]
+def run_std_shift( num_weeks, lag_weight, shift_weeks, origSpend ):
 
-    std_weights = compute_std_weights( lag_weight )
+    # print( "run_std_shift: BEGIN: ", num_weeks )
 
-    # print( "run_std_shift(): colData: ", origSpend, ", weeks: ", num_weeks, " len(colData): ", colDataLen )
+    # std_weights = compute_std_weights( lag_weight )
+    std_weights = jnp.power( lag_weight * jnp.ones(NUM_WEEKS), jnp.arange(NUM_WEEKS, dtype=jnp.float32) )
+    std_weights = std_weights / jnp.sum( std_weights )
+
+    # print( "run_std_shift(): colData: ", origSpend, ", weeks: ", num_weeks, " len(colData): " )
     # print( "run_std_shift() std weights: ", std_weights )
     # print( "sum std weights: ", sum(std_weights) )
 
@@ -338,9 +417,11 @@ def run_std_shift( lag_weight, origSpend, num_weeks, colDataLen ):
 #
 # @functools.partial( jax.jit, static_argnames=['normalise','weeks'] )
 #
-@jax.jit
+# @jax.jit
+@functools.partial( jax.jit, static_argnames=["weeks"] )
 def radstock( data: jnp.ndarray,
               lag_weight: float = .9,
+              shift_weeks: float = 2.,
               normalise: bool = True,
               enableReverseShift = None,
               weeks = 13 ) -> jnp.ndarray:
@@ -361,6 +442,7 @@ def radstock( data: jnp.ndarray,
 
     # print( 'radstock: enable: ', enableReverseShift, "|", type(enableReverseShift) )
     print( 'radstock: data dim: ', jnp.shape(data) )
+    my_weeks = int(13)
 
     #
     jnp_ret = None
@@ -370,19 +452,25 @@ def radstock( data: jnp.ndarray,
 
 
     for colIdx in range( 0, len(dataT) ):
-
         # print( 'lag_weight: ', lag_weight[ colIdx ], " type: ", type(lag_weight) )
         # col_lag_weight = float( lag_weight[ colIdx ] )
 
         col_lag_weight = lag_weight[ colIdx ]
+        col_shift      = shift_weeks[ colIdx ]
 
         origSpend  = dataT[ colIdx ]
-        colData    = xdataT[ colIdx ]
-        colDataLen = jnp.shape(colData)[0]
+        # colData    = xdataT[ colIdx ]
+        # colDataLen = jnp.shape(colData)[0]
         # print( 'colData shape: ', colDataLen )
 
         # branch to either normal adstock
-        branch_res = jax.lax.cond( enableReverseShift[colIdx], run_reverse_shift, run_std_shift, col_lag_weight, origSpend, weeks, colDataLen )
+        #
+        # args = dict( my_weeks= my_weeks, colIdx=colIdx, col_lag_weight= col_lag_weight, orig_spen= origSpend )
+        #branch_res = jax.lax.cond( enableReverseShift[colIdx], run_reverse_shift, run_std_shift,
+        #                           my_weeks, col_lag_weight, col_shift, origSpend )
+
+        #
+        branch_res = run_reverse_shift( my_weeks, col_lag_weight, col_shift, origSpend )
 
         if jnp_ret is None:
             jnp_ret = branch_res
@@ -499,8 +587,8 @@ def carryover(data: jnp.ndarray,
   Returns:
     The carryover values for the given data with the given parameters.
   """
-  lags_arange = jnp.expand_dims(jnp.arange(number_lags, dtype=jnp.float32),
-                                axis=-1)
+  lags_arange = jnp.expand_dims( jnp.arange(number_lags, dtype=jnp.float32),
+                                 axis=-1 )
   convolve_func = _carryover_convolve
   if data.ndim == 3:
     # Since _carryover_convolve is already vmaped in the decorator we only need

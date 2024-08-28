@@ -365,18 +365,12 @@ class LightweightMMM:
         target_accept_prob=target_accept_prob,
         init_strategy=init_strategy )
 
-    # from numpyro.infer import ESS, AIES
-    # kernel = ESS( model=self._model_function, moves={ ESS.DifferentialMove() : 0.8,
-    #                            ESS.RandomMove() : 0.2} )
-    # kernel = AIES(model=self._model_function, moves={ AIES.DEMove() : 0.5,
-    #                                                    AIES.StretchMove() : 0.5 } )
-
     mcmc = numpyro.infer.MCMC(
         sampler=kernel,
         num_warmup=number_warmup,
         num_samples=number_samples,   # number_samples | 1500
         num_chains=number_chains,     # number_chains
-        chain_method='vectorized' )   # 'parallel'
+        chain_method='parallel' )     # 'parallel'
 
     mcmc.run(
         rng_key=jax.random.PRNGKey(seed),
