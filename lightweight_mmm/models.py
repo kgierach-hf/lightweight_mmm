@@ -147,7 +147,7 @@ def _get_transform_default_priors() -> Mapping[str, Prior]:
               _SLOPE:
                   dist.Gamma(concentration=1., rate=1.),
               _SHIFT:
-                  dist.Beta(concentration1=1.,concentration0=100.)
+                  dist.Gamma(concentration=1., rate=100.)
           })
   })
 

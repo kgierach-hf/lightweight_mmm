@@ -273,6 +273,9 @@ def compute_std_weights( lam ):
 
     return ret_val
 
+#
+CONV_SIZE = 25
+NUM_WEEKS = 13
 
 #
 # wrap callback
@@ -280,15 +283,15 @@ def compute_std_weights( lam ):
 def create_zeros_host( pad_size, weights ):
     # print( 'create_zeros_host(): BEGIN : ', weights )
     left_pad = pad_size
-    left_pad = min(8, left_pad)
+    left_pad = min(CONV_SIZE - NUM_WEEKS, left_pad)
     left_pad = max(0, left_pad)
-    right_pad = 21 - 13 - left_pad
+    right_pad = CONV_SIZE - NUM_WEEKS - left_pad
     return np.pad( weights, (left_pad, right_pad) )
 
 
 #
 def create_zeros_wrapper( pad_size, weights ):
-    result_shape = jax.ShapeDtypeStruct( (21,), jnp.float32 )
+    result_shape = jax.ShapeDtypeStruct( (CONV_SIZE,), jnp.float32 )
     return jax.pure_callback( create_zeros_host, result_shape, pad_size, weights )
 
 
@@ -301,8 +304,8 @@ def create_zeros_wrapper( pad_size, weights ):
 # Define the forward pass
 # weights are of dim 13, overall convolution array of len 21
 def custom_pad_fwd( pad_size, w ):
-    p_left = pad_size
-    p_right = 21 - 13 - p_left
+    p_left  = pad_size
+    p_right = CONV_SIZE - NUM_WEEKS - p_left
     # y = jnp.pad( w, (p_left, p_right) )
     y = create_zeros_wrapper( pad_size, w )
 
@@ -340,7 +343,6 @@ create_zeros_wrapper = jax.custom_vjp( create_zeros_wrapper )
 create_zeros_wrapper.defvjp( custom_pad_fwd, custom_pad_bwd )
 
 
-NUM_WEEKS = 13
 
 #
 # reverse-shifted adstock application
@@ -349,8 +351,11 @@ NUM_WEEKS = 13
 def run_reverse_shift( num_weeks, lag_weight, shift_weeks, colData ):
     # print( "run reverse shift: BEGIN: ", num_weeks )
 
-    # shift_weeks = numpyro.sample( "shift_" + idx,  dist.Gamma(concentration=2., rate=2.) )
-    shift_weeks = jnp.maximum( 4.0, shift_weeks )
+    # left pad of maximum value (in this case 8) indicates no shift
+    shift_weeks = CONV_SIZE - NUM_WEEKS - shift_weeks
+    shift_weeks = jnp.minimum( (CONV_SIZE - NUM_WEEKS), shift_weeks )
+    shift_weeks = jnp.maximum( 0.0, shift_weeks )
+    pad = jnp.round( shift_weeks ).astype(int)
 
     # print( "rrs(): lag_weight: ", lag_weight, " num_weeks: ", num_weeks )
 
@@ -358,8 +363,6 @@ def run_reverse_shift( num_weeks, lag_weight, shift_weeks, colData ):
     lag_weights_arr = lag_weights_arr * lag_weight
     weights = jnp.power( lag_weights_arr, jnp.arange(NUM_WEEKS, dtype=jnp.float32) )
     weights = weights / jnp.sum( weights )
-
-    pad = jnp.floor( shift_weeks ).astype(int)
 
     # pad weights left and right as it is a centered convolution
     weights = create_zeros_wrapper( pad, weights )
