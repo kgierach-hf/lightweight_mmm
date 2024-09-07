@@ -294,8 +294,6 @@ def transform_carryover(media_data: jnp.ndarray,
   return media_transforms.apply_exponent_safe(data=carryover, exponent=exponent)
 
 
-## begin karl
-
 def transform_hill_radstock(media_data: jnp.ndarray,
                            custom_priors: MutableMapping[str, Prior],
                            normalise: bool = True,
@@ -356,8 +354,6 @@ def transform_hill_radstock(media_data: jnp.ndarray,
             normalise=normalise, enableReverseShift=enableReverseShift ),
         half_max_effective_concentration=half_max_effective_concentration,
         slope=slope)
-
-## end karl
 
 
 def media_mix_model(
