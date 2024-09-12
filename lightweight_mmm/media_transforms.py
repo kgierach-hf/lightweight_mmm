@@ -16,9 +16,16 @@
 
 import functools
 from typing import Union
+from functools import partial
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.integrate as jintegrate
+import scipy.integrate as integrate
+import numpy as np
+import math
+import numpyro
+import numpyro.distributions as dist
 
 
 @functools.partial(jax.jit, static_argnums=[0, 1])
@@ -59,6 +66,152 @@ def calculate_seasonality(
   return (season_matrix * gamma_seasonality).sum(axis=2).sum(axis=1)
 
 
+# convolution definitions that can enable backwards shift
+CONV_SIZE = 25
+NUM_WEEKS = 13
+
+#
+# wrap callback
+#
+def create_zeros_host( pad_size, weights ):
+    # print( 'create_zeros_host(): BEGIN : ', weights )
+    left_pad = pad_size
+    left_pad = min(CONV_SIZE - NUM_WEEKS, left_pad)
+    left_pad = max(0, left_pad)
+    right_pad = CONV_SIZE - NUM_WEEKS - left_pad
+    return np.pad( weights, (left_pad, right_pad) )
+
+
+#
+def create_zeros_wrapper( pad_size, weights ):
+    result_shape = jax.ShapeDtypeStruct( (CONV_SIZE,), jnp.float32 )
+    return jax.pure_callback( create_zeros_host, result_shape, pad_size, weights )
+
+
+# Define the forward pass
+# weights are of dim 13, overall convolution array of len 21
+def custom_pad_fwd( pad_size, w ):
+    p_left  = pad_size
+    p_right = CONV_SIZE - NUM_WEEKS - p_left
+    # delegate to user space callback
+    y = create_zeros_wrapper( pad_size, w )
+
+    shp = jnp.shape(w)
+    # print( 'shape w: ', shp, " pad size: ", pad_size )
+    # Return the output and any intermediate values needed for backward pass
+    return y, (shp[0], w, p_left, p_right)
+
+
+#
+# Define the backward pass
+#
+def custom_pad_bwd( res, g ):
+    n, w, p_left, p_right = res
+
+    # Extract the gradient for the output (g)
+    # Only the middle part (corresponding to the original x) of g contributes to the gradient of x
+    # the middle part is 'w'
+    grad_x = w
+
+    # Since pad is not an inputs that we differentiate with respect to,
+    # we return None for them
+    return None, grad_x
+
+
+# define create_zeros_wrapper as a custom_vjp
+create_zeros_wrapper = jax.custom_vjp( create_zeros_wrapper )
+
+
+# Register the forward and backward passes
+create_zeros_wrapper.defvjp( custom_pad_fwd, custom_pad_bwd )
+
+
+
+#
+# reverse-shifted adstock application
+#
+@functools.partial( jax.jit )  # , static_argnums=[0,1]
+def run_reverse_shift( num_weeks, lag_weight, shift_weeks, colData ):
+    # print( "run reverse shift: BEGIN: ", num_weeks )
+
+    # left pad of maximum value indicates no shift
+    shift_weeks = CONV_SIZE - NUM_WEEKS - shift_weeks
+    shift_weeks = jnp.minimum( (CONV_SIZE - NUM_WEEKS), shift_weeks )
+    shift_weeks = jnp.maximum( 0.0, shift_weeks )
+    pad = jnp.round( shift_weeks ).astype(int)
+
+    lag_weights_arr = jnp.ones( NUM_WEEKS )
+    lag_weights_arr = lag_weights_arr * lag_weight
+    weights = jnp.power( lag_weights_arr, jnp.arange(NUM_WEEKS, dtype=jnp.float32) )
+    weights = weights / jnp.sum( weights )
+
+    # pad weights left and right as it is a centered convolution
+    weights = create_zeros_wrapper( pad, weights )
+
+    return jax.scipy.signal.convolve( colData, weights, mode="same" )
+
+
+#
+# radstock = "reverse adstock"
+#
+#   the method allows for configured channels to have spend shifted back in time
+#   as the adstock weights are applied.
+#   -> this is done by specifying a '1' in the enableReverseShift array.  any channel
+#      with a 0 in the array is specified as a
+#   -> non-configured channels will behave in the normal way; pushing the spend forward only
+#
+# @functools.partial( jax.jit, static_argnames=['normalise','weeks'] )
+#
+# @jax.jit
+@functools.partial( jax.jit, static_argnames=["weeks"] )
+def radstock( data: jnp.ndarray,
+              lag_weight: float = .9,
+              shift_weeks: float = 2.,
+              normalise: bool = True,
+              enableReverseShift = None,
+              weeks = 13 ) -> jnp.ndarray:
+    """Calculates the adstock value of a given array.
+
+    To learn more about advertising lag:
+    https://en.wikipedia.org/wiki/Advertising_adstock
+
+    Args:
+      data: Input array.
+      lag_weight: lag_weight effect of the adstock function. Default is 0.9.
+      normalise: Whether to normalise the output value. This normalization will
+        divide the output values by (1 / (1 - lag_weight)).
+
+    Returns:
+      The adstock output of the input array.
+    """
+
+    # print( 'radstock: enable: ', enableReverseShift, "|", type(enableReverseShift) )
+    print( 'radstock: data dim: ', jnp.shape(data) )
+    my_weeks = int(13)
+
+    #
+    jnp_ret = None
+    dataT  = data.T
+
+    for colIdx in range( 0, len(dataT) ):
+        col_lag_weight = lag_weight[ colIdx ]
+        col_shift      = shift_weeks[ colIdx ]
+        origSpend  = dataT[ colIdx ]
+
+        branch_res = run_reverse_shift( my_weeks, col_lag_weight, col_shift, origSpend )
+
+        if jnp_ret is None:
+            jnp_ret = branch_res
+        else:
+            jnp_ret = jnp.vstack( (jnp_ret, branch_res) )
+
+    jnp_ret = jnp.array( jnp_ret.T )
+
+    # print( 'radstock(): final shape: ', jnp.shape( jnp_ret ) )
+
+    return  jnp_ret
+
+
 @jax.jit
 def adstock(data: jnp.ndarray,
             lag_weight: float = .9,
@@ -82,11 +235,13 @@ def adstock(data: jnp.ndarray,
                        data: jnp.ndarray,
                        lag_weight: float = lag_weight) -> jnp.ndarray:
     adstock_value = prev_adstock * lag_weight + data
-    return adstock_value, adstock_value# jax-ndarray
+    return adstock_value, adstock_value # jax-ndarray
 
   _, adstock_values = jax.lax.scan(
       f=adstock_internal, init=data[0, ...], xs=data[1:, ...])
+
   adstock_values = jnp.concatenate([jnp.array([data[0, ...]]), adstock_values])
+
   return jax.lax.cond(
       normalise,
       lambda adstock_values: adstock_values / (1. / (1 - lag_weight)),
@@ -156,8 +311,8 @@ def carryover(data: jnp.ndarray,
   Returns:
     The carryover values for the given data with the given parameters.
   """
-  lags_arange = jnp.expand_dims(jnp.arange(number_lags, dtype=jnp.float32),
-                                axis=-1)
+  lags_arange = jnp.expand_dims( jnp.arange(number_lags, dtype=jnp.float32),
+                                 axis=-1 )
   convolve_func = _carryover_convolve
   if data.ndim == 3:
     # Since _carryover_convolve is already vmaped in the decorator we only need
