@@ -195,7 +195,8 @@ def transform_adstock(media_data: jnp.ndarray,
 
 def transform_hill_adstock(media_data: jnp.ndarray,
                            custom_priors: MutableMapping[str, Prior],
-                           normalise: bool = True) -> jnp.ndarray:
+                           normalise: bool = True,
+                           enableReverseShift = None ) -> jnp.ndarray:
   """Transforms the input data with the adstock and hill functions.
 
   Args:
