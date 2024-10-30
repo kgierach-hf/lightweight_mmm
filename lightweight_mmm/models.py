@@ -63,6 +63,9 @@ _GAMMA_SEASONALITY = "gamma_seasonality"
 _WEEKDAY = "weekday"
 _COEF_EXTRA_FEATURES = "coef_extra_features"
 _COEF_SEASONALITY = "coef_seasonality"
+_CHAN_INTERACT_ENABLE = "int_enabler"
+_CHAN_INTERACT = "channel_interaction"
+
 
 MODEL_PRIORS_NAMES = frozenset((
     _INTERCEPT,
@@ -72,7 +75,10 @@ MODEL_PRIORS_NAMES = frozenset((
     _GAMMA_SEASONALITY,
     _WEEKDAY,
     _COEF_EXTRA_FEATURES,
-    _COEF_SEASONALITY))
+    _COEF_SEASONALITY,
+    _CHAN_INTERACT_ENABLE,
+    _CHAN_INTERACT
+))
 
 _EXPONENT = "exponent"
 _LAG_WEIGHT = "lag_weight"
@@ -107,7 +113,9 @@ def _get_default_priors() -> Mapping[str, Prior]:
       _GAMMA_SEASONALITY: dist.Normal(loc=0., scale=1.),
       _WEEKDAY: dist.Normal(loc=0., scale=.5),
       _COEF_EXTRA_FEATURES: dist.Normal(loc=0., scale=1.),
-      _COEF_SEASONALITY: dist.HalfNormal(scale=.5)
+      _COEF_SEASONALITY: dist.HalfNormal(scale=.5),
+      _CHAN_INTERACT: dist.Normal(loc=0., scale=1.),
+      _CHAN_INTERACT_ENABLE: dist.Uniform(low=0.0, high=0.49)
   })
 
 
@@ -368,6 +376,7 @@ def media_mix_model(
     transform_kwargs: Optional[MutableMapping[str, Any]] = None,
     weekday_seasonality: bool = False,
     extra_features: Optional[jnp.ndarray] = None,
+    media_interactions: Optional[jnp.ndarray] = None,
     channel_opts: Optional[Dict[str, Any]] = None
 ) -> None:
   """Media mix model.
@@ -466,6 +475,41 @@ def media_mix_model(
       transform_kwargs["number_lags"] = 13 * 7
     elif transform_function == "carryover" and not transform_kwargs:
       transform_kwargs = {"number_lags": 13 * 7}
+
+  # transform data with interactions
+  if media_interactions is not None:
+      print( 'kdbg: media_interactions: ', media_interactions )
+
+      with numpyro.plate(name=f"media_interactions_plate", size=n_channels):
+          coef_enable = numpyro.sample( name=_CHAN_INTERACT_ENABLE,
+                                        fn=custom_priors.get(_CHAN_INTERACT_ENABLE, default_priors[_CHAN_INTERACT_ENABLE] ) )
+          coef_enable = jnp.round( coef_enable )
+          print( "coef_enable (samples): ", coef_enable )
+          mu_int = jnp.zeros( n_channels )
+          sigma_int = jnp.ones( n_channels )
+          # custom_priors.get(_WEEKDAY, default_priors[_WEEKDAY])
+          coef_interact = numpyro.sample( name=_CHAN_INTERACT,
+                                          fn=custom_priors.get(_CHAN_INTERACT, dist.Normal( loc=mu_int, scale=sigma_int) ) )
+          new_media_data = None
+          for cIdx in range(0,n_channels):
+              mc = media_data[ :, cIdx ]
+              mc = jnp.reshape( mc, (data_size,1) )
+
+              print( 'coeff enabled for idx: ', cIdx, " shp: ", jnp.shape(mc) )
+              new_mc = ((1.0 - coef_enable[cIdx]) * mc)  + \
+                       coef_enable[cIdx] * jnp.add( (1.0 - media_interactions) * mc, media_interactions * jnp.maximum( 0, mc + (mc * coef_interact[cIdx]) ) )
+              print( 'new_mc shp: ', jnp.shape(new_mc) )
+
+              if new_media_data is None:
+                  new_media_data = jnp.reshape( new_mc, (data_size,1) )
+              else:
+                  new_mc = jnp.reshape( new_mc, (data_size,1) )
+                  new_media_data = jnp.concat( [new_media_data, new_mc], axis=1 )
+
+          # assign out the modified data
+          media_data = new_media_data
+
+  # end spend interactions
 
   media_transformed = numpyro.deterministic(
       name="media_transformed",
