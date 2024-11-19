@@ -65,6 +65,9 @@ _COEF_EXTRA_FEATURES = "coef_extra_features"
 _COEF_SEASONALITY = "coef_seasonality"
 _CHAN_INTERACT_ENABLE = "int_enabler"
 _CHAN_INTERACT = "channel_interaction"
+_COEF_BRAND = "coef_brand"
+_BRAND_AD_EFFECT_RETENTION_RATE = "brand_ad_effect_retention_rate"
+_BRAND_PEAK_EFFECT_DELAY = "brand_peak_effect_delay"
 
 
 MODEL_PRIORS_NAMES = frozenset((
@@ -77,8 +80,12 @@ MODEL_PRIORS_NAMES = frozenset((
     _COEF_EXTRA_FEATURES,
     _COEF_SEASONALITY,
     _CHAN_INTERACT_ENABLE,
-    _CHAN_INTERACT
+    _CHAN_INTERACT,
+    _COEF_BRAND,
+    _BRAND_AD_EFFECT_RETENTION_RATE,
+    _BRAND_PEAK_EFFECT_DELAY
 ))
+
 
 _EXPONENT = "exponent"
 _LAG_WEIGHT = "lag_weight"
@@ -115,7 +122,10 @@ def _get_default_priors() -> Mapping[str, Prior]:
       _COEF_EXTRA_FEATURES: dist.Normal(loc=0., scale=1.),
       _COEF_SEASONALITY: dist.HalfNormal(scale=.5),
       _CHAN_INTERACT: dist.Normal(loc=0., scale=1.),
-      _CHAN_INTERACT_ENABLE: dist.Uniform(low=0.0, high=0.49)
+      _CHAN_INTERACT_ENABLE: dist.Uniform(low=0.0, high=0.49),
+      _COEF_BRAND: dist.Normal(loc=0., scale=1.),
+      _BRAND_AD_EFFECT_RETENTION_RATE: dist.Beta(concentration1=10., concentration0=1.),
+      _BRAND_PEAK_EFFECT_DELAY: dist.HalfNormal(scale=15.),
   })
 
 
@@ -303,6 +313,51 @@ def transform_carryover(media_data: jnp.ndarray,
   return media_transforms.apply_exponent_safe(data=carryover, exponent=exponent)
 
 
+# this method only applies the carryover adstock transformation.
+# we could add the exponent later on, if we believe saturation to be a factor
+def brand_carryover( brand_data: jnp.ndarray,
+                     custom_priors: MutableMapping[str, Prior],
+                     number_lags: int = 26 ) -> jnp.ndarray:
+    """Transforms the input data with the carryover function.
+
+    Args:
+      media_data: Media data to be transformed. It is expected to have 2 dims for
+        national models and 3 for geo models.
+      custom_priors: The custom priors we want the model to take instead of the
+        default ones. The possible names of parameters for carryover and exponent
+        are "ad_effect_retention_rate_plate", "peak_effect_delay_plate" and
+        "exponent".
+      number_lags: Number of lags for the carryover function.
+
+    Returns:
+      The transformed media data.
+    """
+    # transform_default_priors = _get_transform_default_priors()["carryover"]
+
+    with numpyro.plate(name=f"{_BRAND_AD_EFFECT_RETENTION_RATE}_plate",
+                       size=brand_data.shape[1]):
+        ad_effect_retention_rate = numpyro.sample(
+            name=_BRAND_AD_EFFECT_RETENTION_RATE,
+            fn=custom_priors.get(
+                _BRAND_AD_EFFECT_RETENTION_RATE,
+                _get_default_priors()[_BRAND_AD_EFFECT_RETENTION_RATE]))
+
+    with numpyro.plate(name=f"{_BRAND_PEAK_EFFECT_DELAY}_plate",
+                       size=brand_data.shape[1]):
+        peak_effect_delay = numpyro.sample(
+            name=_BRAND_PEAK_EFFECT_DELAY,
+            fn=custom_priors.get(
+                _BRAND_PEAK_EFFECT_DELAY, _get_default_priors()[_BRAND_PEAK_EFFECT_DELAY]))
+
+    carryover = media_transforms.carryover(
+        data=brand_data,
+        ad_effect_retention_rate=ad_effect_retention_rate,
+        peak_effect_delay=peak_effect_delay,
+        number_lags=number_lags )
+
+    return carryover
+
+
 def transform_hill_radstock(media_data: jnp.ndarray,
                            custom_priors: MutableMapping[str, Prior],
                            normalise: bool = True,
@@ -377,6 +432,7 @@ def media_mix_model(
     weekday_seasonality: bool = False,
     extra_features: Optional[jnp.ndarray] = None,
     media_interactions: Optional[jnp.ndarray] = None,
+    brand: Optional[jnp.ndarray] = None,
     channel_opts: Optional[Dict[str, Any]] = None
 ) -> None:
   """Media mix model.
@@ -406,6 +462,7 @@ def media_mix_model(
   n_channels = media_data.shape[1]
   geo_shape = (media_data.shape[2],) if media_data.ndim == 3 else ()
   n_geos = media_data.shape[2] if media_data.ndim == 3 else 1
+  n_brand = 0 if brand is None else brand.shape[1]
 
   with numpyro.plate(name=f"{_INTERCEPT}_plate", size=n_geos):
     intercept = numpyro.sample(
@@ -511,6 +568,20 @@ def media_mix_model(
 
   # end spend interactions
 
+  # begin brand
+  brand_contribution = jnp.zeros( data_size )
+  if (brand is not None) and len(brand) > 0:
+    with numpyro.plate(name=f"media_interactions_plate", size=n_brand):
+      coef_brand = numpyro.sample( name=_COEF_BRAND,
+                                   fn=custom_priors.get( _COEF_BRAND, default_priors[_COEF_BRAND] ) )
+      brand_xform = brand_carryover( brand, custom_priors )
+      brand_einsum = "tc, c -> t"  # t = time, c = channel
+      brand_contribution = jnp.einsum( brand_einsum, brand_xform, coef_brand )
+      print( 'INFO: brand contrib: shp=', jnp.shape(brand_contribution) )
+  else:
+      print( 'INFO: NO BRANDS specified, brand contrib: shp=', jnp.shape(brand_contribution), "|", n_brand )
+  # end brand
+
   media_transformed = numpyro.deterministic(
       name="media_transformed",
       value=transform_function(media_data,
@@ -539,28 +610,12 @@ def media_mix_model(
           fn=custom_priors.get(
               _COEF_SEASONALITY, default_priors[_COEF_SEASONALITY]))
   # expo_trend is B(1, 1) so that the exponent on time is in [.5, 1.5].
+
   prediction = (
       intercept + coef_trend * trend ** expo_trend +
       seasonality * coef_seasonality +
-      jnp.einsum(media_einsum, media_transformed, coef_media))
-
-
-  #baseline1 = numpyro.deterministic( name="seasonality1", value= intercept + coef_trend * trend ** expo_trend )
-  #print( "baseline1: ", baseline1 )
-
-  #media_xformed = numpyro.deterministic( name="media_xformed", value= media_transformed )
-  #print( "mediax: ", media_xformed )
-
-  #coef_media1 = numpyro.deterministic( name="coef_media1", value= coef_media )
-  #print( "coef_media1: ", coef_media1 )
-
-  #media1 = numpyro.deterministic( name="mediaxform", value= jnp.einsum(media_einsum, media_transformed, coef_media) )
-  #print( "media1: ", media1 )
-  #seasonality1 = numpyro.deterministic( name="seasonality1", value= seasonality * coef_seasonality )
-  #print( "seasonality1: ", seasonality1 )
-  #prediction1 = numpyro.deterministic( name="prediction1", value=prediction )
-  #print( "prediction1: ", prediction1 )
-
+      brand_contribution +
+      jnp.einsum(media_einsum, media_transformed, coef_media) )
 
   if extra_features is not None:
     plate_prefixes = ("extra_feature",)

@@ -262,6 +262,7 @@ class LightweightMMM:
       target: jnp.ndarray,
       extra_features: Optional[jnp.ndarray] = None,
       media_interactions: Optional[jnp.ndarray] = None,
+      brand: Optional[jnp.ndarray] = None,
       degrees_seasonality: int = 2,
       seasonality_frequency: int = 52,
       weekday_seasonality: bool = False,
@@ -381,6 +382,7 @@ class LightweightMMM:
         media_data=jnp.array(media),
         extra_features=extra_features,
         media_interactions=media_interactions,
+        brand=brand,
         target_data=jnp.array(target),
         media_prior=media_prior,                     # removed jnp.array
         degrees_seasonality=degrees_seasonality,
