@@ -368,6 +368,7 @@ def media_mix_model(
     transform_kwargs: Optional[MutableMapping[str, Any]] = None,
     weekday_seasonality: bool = False,
     extra_features: Optional[jnp.ndarray] = None,
+    baseline_data: jnp.ndarray = None,
     channel_opts: Optional[Dict[str, Any]] = None
 ) -> None:
   """Media mix model.
@@ -398,7 +399,13 @@ def media_mix_model(
   geo_shape = (media_data.shape[2],) if media_data.ndim == 3 else ()
   n_geos = media_data.shape[2] if media_data.ndim == 3 else 1
 
-  with numpyro.plate(name=f"{_INTERCEPT}_plate", size=n_geos):
+  n_baseline = 1 if baseline_data is None else baseline_data.shape[1]
+  print( "lwmmm: n_baseline: ", n_baseline, ' shp: ', baseline_data.shape )
+
+  if baseline_data is None:
+      baseline_data = jnp.ones(1)
+
+  with numpyro.plate(name=f"{_INTERCEPT}_plate", size=n_geos*n_baseline):
     intercept = numpyro.sample(
         name=_INTERCEPT,
         fn=custom_priors.get(_INTERCEPT, default_priors[_INTERCEPT]))
@@ -409,12 +416,13 @@ def media_mix_model(
         fn=custom_priors.get(_SIGMA, default_priors[_SIGMA]))
 
   # TODO(): Force all geos to have the same trend sign.
-  with numpyro.plate(name=f"{_COEF_TREND}_plate", size=n_geos):
+  with numpyro.plate(name=f"{_COEF_TREND}_plate", size=n_geos*n_baseline):
     coef_trend = numpyro.sample(
         name=_COEF_TREND,
         fn=custom_priors.get(_COEF_TREND, default_priors[_COEF_TREND]))
 
-  expo_trend = numpyro.sample(
+  with numpyro.plate(name=f"{_COEF_TREND}_plate", size=n_geos*n_baseline):
+    expo_trend = numpyro.sample(
       name=_EXPO_TREND,
       fn=custom_priors.get(
           _EXPO_TREND, default_priors[_EXPO_TREND]))
@@ -482,6 +490,9 @@ def media_mix_model(
   media_einsum = "tc, c -> t"  # t = time, c = channel
   coef_seasonality = 1
 
+  if n_baseline > 1:
+    trend = jnp.expand_dims(trend, axis=-1)
+
   # TODO(): Add conversion of prior for HalfNormal distribution.
   if media_data.ndim == 3:  # For geo model's case
     trend = jnp.expand_dims(trend, axis=-1)
@@ -496,26 +507,15 @@ def media_mix_model(
               _COEF_SEASONALITY, default_priors[_COEF_SEASONALITY]))
   # expo_trend is B(1, 1) so that the exponent on time is in [.5, 1.5].
   prediction = (
-      intercept + coef_trend * trend ** expo_trend +
+      jnp.sum( jnp.multiply( baseline_data, intercept ), axis=1) +
+      jnp.sum( jnp.multiply( baseline_data, coef_trend * trend ** expo_trend), axis=1) +
       seasonality * coef_seasonality +
       jnp.einsum(media_einsum, media_transformed, coef_media))
 
-
-  #baseline1 = numpyro.deterministic( name="seasonality1", value= intercept + coef_trend * trend ** expo_trend )
-  #print( "baseline1: ", baseline1 )
-
-  #media_xformed = numpyro.deterministic( name="media_xformed", value= media_transformed )
-  #print( "mediax: ", media_xformed )
-
-  #coef_media1 = numpyro.deterministic( name="coef_media1", value= coef_media )
-  #print( "coef_media1: ", coef_media1 )
-
-  #media1 = numpyro.deterministic( name="mediaxform", value= jnp.einsum(media_einsum, media_transformed, coef_media) )
-  #print( "media1: ", media1 )
-  #seasonality1 = numpyro.deterministic( name="seasonality1", value= seasonality * coef_seasonality )
-  #print( "seasonality1: ", seasonality1 )
-  #prediction1 = numpyro.deterministic( name="prediction1", value=prediction )
-  #print( "prediction1: ", prediction1 )
+  # logging
+  numpyro.deterministic( name="baseline_trend", value= jnp.sum( jnp.multiply( baseline_data, intercept ), axis=1) + 
+                                                       jnp.sum( jnp.multiply( baseline_data, coef_trend * trend ** expo_trend), axis=1) )
+  numpyro.deterministic( name="baseline_seas", value= seasonality * coef_seasonality )
 
 
   if extra_features is not None:
@@ -535,6 +535,8 @@ def media_mix_model(
     extra_features_effect = jnp.einsum(extra_features_einsum,
                                        extra_features,
                                        coef_extra_features)
+    # logging
+    numpyro.deterministic( name="baseline_extra", value=extra_features_effect )
     prediction += extra_features_effect
 
   if weekday_seasonality:

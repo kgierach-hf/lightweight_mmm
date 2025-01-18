@@ -166,6 +166,8 @@ class LightweightMMM:
       init=False, repr=False, hash=True, compare=False)
   _mcmc: numpyro.infer.MCMC = dataclasses.field(
       init=False, repr=False, hash=False, compare=False)
+  _baseline_data: jnp.array = dataclasses.field(
+      init=False, repr=False, hash=False, compare=True)
 
   def __post_init__(self):
     if self.model_name not in _NAMES_TO_MODEL_TRANSFORMS:
@@ -273,7 +275,8 @@ class LightweightMMM:
                               jnp.ndarray] = numpyro.infer.init_to_median,
       custom_priors: Optional[Dict[str, Prior]] = None,
       seed: Optional[int] = None,
-      channel_opts: Optional[Dict[str, Any]] = None ) -> None:
+      channel_opts: Optional[Dict[str, Any]] = None,
+      baseline_data: jnp.ndarray = None ) -> None:
     """Fits MMM given the media data, extra features, costs and sales/KPI.
 
     For detailed information on the selected model please refer to its
@@ -384,7 +387,8 @@ class LightweightMMM:
         weekday_seasonality=weekday_seasonality,
         custom_priors=custom_priors,
         channel_opts=channel_opts,
-        transform_kwargs=channel_opts )
+        transform_kwargs=channel_opts,
+        baseline_data=baseline_data )
 
     self.custom_priors = custom_priors
     if media_names is not None:
@@ -407,6 +411,7 @@ class LightweightMMM:
     self._extra_features = extra_features# jax-devicearray
     self._mcmc = mcmc
     self.channel_opts = channel_opts
+    self._baseline_data = baseline_data
     logging.info("Model has been fitted")
 
   def print_summary(self) -> None:
@@ -431,7 +436,8 @@ class LightweightMMM:
       weekday_seasonality: bool,
       model: Callable[[Any], None],
       posterior_samples: Dict[str, jnp.ndarray],
-      custom_priors: Dict[str, Prior]
+      custom_priors: Dict[str, Prior],
+      baseline_data: jnp.ndarray
       ) -> Dict[str, jnp.ndarray]:
     """Encapsulates the numpyro.infer.Predictive function for predict method.
 
@@ -470,7 +476,8 @@ class LightweightMMM:
             frequency=frequency,
             transform_function=transform_function,
             custom_priors=custom_priors,
-            weekday_seasonality=weekday_seasonality)
+            weekday_seasonality=weekday_seasonality,
+            baseline_data=baseline_data )
 
   def predict(
       self,
@@ -478,6 +485,7 @@ class LightweightMMM:
       extra_features: Optional[jnp.ndarray] = None,
       media_gap: Optional[jnp.ndarray] = None,
       target_scaler: Optional[preprocessing.CustomScaler] = None,
+      baseline_data: Optional[jnp.ndarray] = None,
       seed: Optional[int] = None
   ) -> jnp.ndarray:
     """Runs the model to obtain predictions for the given input data.
@@ -524,19 +532,35 @@ class LightweightMMM:
                 jnp.zeros((media_gap.shape[0], *self._extra_features.shape[1:]))
             ],
             axis=0)
+
+      if baseline_data is not None:
+        previous_baseline = jnp.concatenate(
+            arrays=[
+                self._baseline_data,
+                jnp.zeros((media_gap.shape[0], *self._baseline_data.shape[1:]))
+            ],
+            axis=0)
     else:
       previous_media = self.media
       previous_extra_features = self._extra_features
+      previous_baseline = self._baseline_data
 
     full_media = jnp.concatenate(arrays=[previous_media, media], axis=0)
+
     if extra_features is not None:
       full_extra_features = jnp.concatenate(
           arrays=[previous_extra_features, extra_features], axis=0)
     else:
       full_extra_features = None
+
+    if baseline_data is not None:
+        full_baseline = jnp.concatenate(
+            arrays=[previous_baseline, baseline_data], axis=0)
+    else:
+        full_baseline = None
+
     if seed is None:
       seed = utils.get_time_seed()
-
 
     prediction = self._predict(
         rng_key=jax.random.PRNGKey(seed=seed),
@@ -549,7 +573,8 @@ class LightweightMMM:
         transform_function=self._model_transform_function,
         model=self._model_function,
         custom_priors=self.custom_priors,
-        posterior_samples=self.trace)["mu"][:, previous_media.shape[0]:]
+        posterior_samples=self.trace,
+        baseline_data=full_baseline )["mu"][:, previous_media.shape[0]:]
 
     if target_scaler:
       prediction = target_scaler.inverse_transform(prediction)
