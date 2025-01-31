@@ -400,7 +400,7 @@ def media_mix_model(
   n_geos = media_data.shape[2] if media_data.ndim == 3 else 1
 
   n_baseline = 1 if baseline_data is None else baseline_data.shape[1]
-  print( "lwmmm: n_baseline: ", n_baseline, ' shp: ', baseline_data.shape )
+  print( "lwmmm: n_baseline: ", n_baseline )
 
   if baseline_data is None:
       baseline_data = jnp.ones(1)
@@ -513,7 +513,7 @@ def media_mix_model(
       jnp.einsum(media_einsum, media_transformed, coef_media))
 
   # logging
-  numpyro.deterministic( name="baseline_trend", value= jnp.sum( jnp.multiply( baseline_data, intercept ), axis=1) + 
+  numpyro.deterministic( name="baseline_trend", value= jnp.sum( jnp.multiply( baseline_data, intercept ), axis=1) +
                                                        jnp.sum( jnp.multiply( baseline_data, coef_trend * trend ** expo_trend), axis=1) )
   numpyro.deterministic( name="baseline_seas", value= seasonality * coef_seasonality )
 
